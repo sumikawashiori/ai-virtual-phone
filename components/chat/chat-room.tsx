@@ -4573,6 +4573,77 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         }
     };
 
+    /** 群聊继续生成：以暂停保留的整轮文本（[角色名]: 格式）为已写开头续写。
+     *  群聊一轮可能有多个角色分段，所以已写内容取整轮的 editableResponseText，
+     *  并要求模型沿用同一格式接着写，新内容作为后续轮次落库。 */
+    const handleGroupContinueTruncated = async (msgId: string) => {
+        if (isGeneratingRef.current) {
+            showChatToast("正在生成中，请稍候");
+            return;
+        }
+        setActiveMessageId(null);
+
+        const storedMessages = loadChatMessages(session.id);
+        const target = storedMessages.find(item => item.id === msgId);
+        if (!target || target.role !== "assistant") return;
+
+        // 整轮同享 responseRoundId；缺失（老数据）时退回按 batch 取
+        const round = target.responseRoundId
+            ? storedMessages.filter(item => item.responseRoundId === target.responseRoundId && item.role === "assistant")
+            : target.responseBatchId
+                ? storedMessages.filter(item => item.responseBatchId === target.responseBatchId && item.role === "assistant")
+                : [target];
+
+        // 已写内容优先用整轮可编辑文本（带 [角色名]: 前缀），否则按发言人重建
+        const writtenSoFar = (round.find(item => item.editableResponseText?.trim())?.editableResponseText
+            || round
+                .map(item => {
+                    const body = (item.content || "").trim();
+                    if (!body) return "";
+                    const speaker = item.senderName || "";
+                    return speaker ? `[${speaker}]: ${body}` : body;
+                })
+                .filter(Boolean)
+                .join("\n")
+        ).trim();
+        if (!writtenSoFar) {
+            showChatToast("这轮回复没有可续写的内容");
+            return;
+        }
+
+        const roundStartIndex = storedMessages.findIndex(item => item.id === round[0].id);
+        const history = [
+            ...storedMessages.slice(0, roundStartIndex < 0 ? storedMessages.length : roundStartIndex),
+            {
+                ...round[0],
+                id: `${round[0].id}__continue_ctx`,
+                content: writtenSoFar,
+                mediaType: undefined,
+                mediaData: undefined,
+                statusPanel: undefined,
+                innerMonologue: undefined,
+                senderName: undefined,
+                senderCharacterId: undefined,
+            } as ChatMessage,
+            {
+                id: `${round[0].id}__continue_hint`,
+                sessionId: session.id,
+                role: "system" as const,
+                content: "这轮群聊回复在中途被打断了。请沿用 [角色名]: 的格式紧接着上文继续，不要重复已经发过的内容，也不要重新开场或总结；已经说完话的角色不必再次发言。",
+                status: "sent" as const,
+                createdAt: new Date().toISOString(),
+            } as ChatMessage,
+        ];
+
+        cancelFollowUp(session.id);
+        await runManagedGeneration({ history, errorPrefix: "继续生成失败" });
+
+        for (const item of round) {
+            if (item.truncated) updateChatMessage(item.id, { truncated: undefined });
+        }
+        syncMessagesFromStorage();
+    };
+
     const handleRetry = async (msgId: string) => {
         const msgIndex = messages.findIndex(m => m.id === msgId);
         if (msgIndex === -1 || messages[msgIndex].role !== "assistant") return;
@@ -5131,7 +5202,12 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 </div>
                 <div className="flex">
                     {m.role === "assistant" && m.truncated && (
-                        <button onClick={() => void handleContinueTruncated(storedMessageId)} className="ctx-menu-btn">继续生成</button>
+                        <button
+                            onClick={() => void (session.isGroup
+                                ? handleGroupContinueTruncated(storedMessageId)
+                                : handleContinueTruncated(storedMessageId))}
+                            className="ctx-menu-btn"
+                        >继续生成</button>
                     )}
                     <button onClick={() => { setQuotingMessage(m); setActiveMessageId(null); }} className="ctx-menu-btn">引用</button>
                     {options?.allowMultiSelect !== false && (
