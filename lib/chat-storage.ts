@@ -99,6 +99,8 @@ export type ChatMessage = {
     responseRoundId?: string; // Group-chat whole-round id shared across all bubbles in one assistant turn
     toolExecutionId?: string; // Links visible tool attachments to their persisted tool result
     editableResponseText?: string; // Processed text shown in the reply editor
+    /** 用户中途暂停生成时保留下来的部分输出：内容不完整，可作为「继续生成」的起点 */
+    truncated?: boolean;
     isRetracted?: boolean;
     mediaType?: "image" | "audio" | "video"
         | "red_packet" | "transfer" | "location"
@@ -1799,7 +1801,7 @@ export async function persistMessageVoiceAudio(
 
 export function updateChatMessage(
     messageId: string,
-    patch: Partial<Pick<ChatMessage, "content" | "mediaType" | "mediaUrl" | "mediaData">>,
+    patch: Partial<Pick<ChatMessage, "content" | "mediaType" | "mediaUrl" | "mediaData" | "truncated">>,
 ): ChatMessage | null {
     const idx = _messagesCache.findIndex(m => m.id === messageId);
     if (idx === -1) return null;

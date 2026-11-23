@@ -2670,6 +2670,62 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         setChatToast(text);
     };
 
+    /** 暂停保留：把已流出的部分内容整理成可落库的文本。
+     *  截断点往往落在协议标签中间，这里裁掉未闭合的 [状态栏]/[内心] 整块、
+     *  末尾半截富媒体指令，以及写了一半的工具指令，避免协议残片进聊天记录。 */
+    const buildPausedRawText = (raw: string): string => {
+        let text = raw;
+        for (const tag of ["状态栏", "内心"]) {
+            const open = text.lastIndexOf(`[${tag}]`);
+            if (open !== -1 && !text.slice(open).includes(`[/${tag}]`)) {
+                text = text.slice(0, open);
+            }
+        }
+        const lastClose = text.lastIndexOf("]");
+        const danglingOpen = text.indexOf("[", lastClose + 1);
+        if (danglingOpen !== -1) text = text.slice(0, danglingOpen);
+        return stripEditableToolTags(text).trim();
+    };
+
+    /** 把暂停瞬间已接收的流式内容落库为一条截断回复（truncated=true），
+     *  返回是否真的保留下了内容（工具轮中途暂停时累积为空，按原行为什么都不留）。 */
+    const persistPausedPartialOutput = async (): Promise<boolean> => {
+        if (streamParseFrameRef.current) {
+            cancelAnimationFrame(streamParseFrameRef.current);
+            streamParseFrameRef.current = 0;
+        }
+        const raw = streamAccumRef.current;
+        streamAccumRef.current = "";
+        setStreamPreview(null);
+        const safeText = buildPausedRawText(raw);
+        if (!safeText) return false;
+
+        const beforeIds = new Set(loadChatMessages(session.id).map(msg => msg.id));
+        try {
+            if (session.isGroup) {
+                const nameToId = new Map(groupCharacters.map(item => [item.name, item.id]));
+                const results = parseGroupChatResponse(safeText, nameToId)
+                    .filter(item => item.responseText.trim());
+                if (results.length === 0) return false;
+                // guard 传 undefined：本次落库发生在 abort 之后，不能再被停止信号打断
+                await processGroupParts(results, setMessages, undefined, undefined, { instantReveal: true });
+            } else {
+                await splitAndSaveAIMessages(safeText, { rawResponseText: raw, instantReveal: true });
+            }
+        } catch (error) {
+            console.warn("[ChatRoom] 保留暂停内容失败:", error);
+            return false;
+        }
+
+        let kept = false;
+        for (const msg of loadChatMessages(session.id)) {
+            if (beforeIds.has(msg.id) || msg.role !== "assistant") continue;
+            updateChatMessage(msg.id, { truncated: true });
+            kept = true;
+        }
+        return kept;
+    };
+
     const clearStuckGeneration = () => {
         const cancelledRun = cancelGenerationRun(session.id);
         cancelBackgroundGeneration(session.id);
@@ -2693,14 +2749,53 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         setIsGenerating(false);
         clearGenerationLock(session.id);
         setPendingGenerate(true);
-        syncMessagesFromStorage();
-        showChatToast("已停止本轮生成");
+        // 先把已流出的部分内容落库，再刷新列表——否则刚保留的截断消息会被旧快照覆盖
+        void persistPausedPartialOutput().then(kept => {
+            syncMessagesFromStorage();
+            showChatToast(kept ? "已暂停，保留已生成内容" : "已停止本轮生成");
+        });
     };
 
     const clearOfflineGeneration = () => {
         const cancelled = cancelOfflineGenerationRun(session.id);
         if (!cancelled && !isOfflineGenerating) return;
+        if (offlineStreamFrameRef.current) {
+            cancelAnimationFrame(offlineStreamFrameRef.current);
+            offlineStreamFrameRef.current = 0;
+        }
         const pendingText = offlineGenerationInputRef.current || pendingOfflineUserText;
+        const rawPartial = offlineStreamAccumRef.current;
+        offlineStreamAccumRef.current = "";
+        setOfflineStreamPreview(null);
+
+        // 已流出内容按与引擎同源的顺序清洗解析，够一条正文就存成截断轮次保留下来
+        const previewRaw = stripLiteralTexts(rawPartial, streamPreviewTagConfig.stripTexts);
+        const parsed = parseOfflineResponse(previewRaw, streamPreviewTagConfig.summaryTag);
+        const partialContent = (parsed.content
+            ? stripXmlTagBlocks(parsed.content, [streamPreviewTagConfig.summaryTag, ...streamPreviewTagConfig.offlineThinking])
+            : stripXmlTagBlocks(previewRaw, [streamPreviewTagConfig.summaryTag, ...streamPreviewTagConfig.offlineThinking])
+                .replace(/<\/?(?:content|summary|thinking|thought|think)>/gi, "")
+                .replace(/<[^>]+>/g, "")
+        ).trim();
+
+        if (partialContent && pendingText) {
+            const saved = appendChatOfflineTurn({
+                sessionId: session.id,
+                userContent: pendingText,
+                assistantContent: partialContent,
+                summary: parsed.summary.trim(),
+                summaryTag: parsed.summaryTag || streamPreviewTagConfig.summaryTag,
+                rawText: rawPartial,
+                truncated: true,
+            });
+            setOfflineTurns(prev => [...prev, saved]);
+            setPendingOfflineUserText("");
+            offlineGenerationInputRef.current = "";
+            setIsOfflineGenerating(false);
+            showChatToast("已暂停，保留已生成内容");
+            return;
+        }
+
         offlineTextInputRef.current?.restoreIfEmpty(pendingText);
         setPendingOfflineUserText("");
         offlineGenerationInputRef.current = "";
@@ -4365,6 +4460,119 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         }
     };
 
+    /** 继续生成：把暂停保留的截断回复作为已写开头，让模型接着往下写。
+     *  做法是把截断内容连同一条续写指令送进上下文（不删原消息），
+     *  新内容落成同一会话的后续消息，成功后清掉原消息的截断标记。 */
+    const handleContinueTruncated = async (msgId: string) => {
+        if (isGeneratingRef.current) {
+            showChatToast("正在生成中，请稍候");
+            return;
+        }
+        setActiveMessageId(null);
+
+        const storedMessages = loadChatMessages(session.id);
+        const target = storedMessages.find(item => item.id === msgId);
+        if (!target || target.role !== "assistant") return;
+
+        // 同一批次（responseBatchId）的几条气泡同属这次被暂停的回复，一起作为已写开头
+        const batch = target.responseBatchId
+            ? storedMessages.filter(item => item.responseBatchId === target.responseBatchId && item.role === "assistant")
+            : [target];
+        const writtenSoFar = batch
+            .map(item => (item.rawResponseText || item.content || "").trim())
+            .filter(Boolean)
+            .join("\n\n")
+            .trim();
+        if (!writtenSoFar) {
+            showChatToast("这条回复没有可续写的内容");
+            return;
+        }
+
+        const targetIndex = storedMessages.findIndex(item => item.id === batch[0].id);
+        const history = [
+            ...storedMessages.slice(0, targetIndex < 0 ? storedMessages.length : targetIndex),
+            {
+                ...batch[0],
+                id: `${batch[0].id}__continue_ctx`,
+                content: writtenSoFar,
+                mediaType: undefined,
+                mediaData: undefined,
+                statusPanel: undefined,
+                innerMonologue: undefined,
+            } as ChatMessage,
+            {
+                id: `${batch[0].id}__continue_hint`,
+                sessionId: session.id,
+                role: "system" as const,
+                content: "你上一条回复在中途被打断了。请紧接着上文最后一个字继续写完，不要重复已经写过的内容，也不要重新开头或总结。",
+                status: "sent" as const,
+                createdAt: new Date().toISOString(),
+            } as ChatMessage,
+        ];
+
+        cancelFollowUp(session.id);
+        await runManagedGeneration({ history, errorPrefix: "继续生成失败" });
+
+        // 续写已落库：原消息不再是「待续」状态
+        for (const item of batch) {
+            if (item.truncated) updateChatMessage(item.id, { truncated: undefined });
+        }
+        syncMessagesFromStorage();
+    };
+
+    /** 线下继续生成：以暂停保留的截断正文为开头续写，新内容追加回同一轮次。 */
+    const handleOfflineContinueTruncated = async (turnId: string) => {
+        if (isOfflineGenerating) {
+            showChatToast("线下回复生成中");
+            return;
+        }
+        const idx = offlineTurns.findIndex(turn => turn.id === turnId);
+        if (idx < 0) return;
+        const targetTurn = offlineTurns[idx];
+        const writtenSoFar = targetTurn.assistantContent.trim();
+        if (!writtenSoFar) {
+            showChatToast("这一轮没有可续写的内容");
+            return;
+        }
+
+        setActiveOfflineTarget(null);
+        cancelFollowUp(session.id);
+        setIsOfflineGenerating(true);
+        offlineStreamAccumRef.current = "";
+        setOfflineStreamPreview(null);
+        const offlineRun = createOfflineGenerationRun(session.id);
+        const offlineRunId = offlineRun.runId;
+        const isCurrentOfflineRun = () => isOfflineGenerationRunActive(session.id, offlineRunId);
+
+        try {
+            // 已写内容与续写要求一并作为本轮输入，之前的轮次照常作为上文
+            const continuePrompt = `${targetTurn.userContent.trim()}\n\n[你上一次的回复在中途被打断，已写出的部分如下]\n${writtenSoFar}\n\n[请紧接着最后一个字继续写完，不要重复已写内容，也不要重新开头]`;
+            const history = buildOfflinePromptHistory(offlineTurns.slice(0, idx), continuePrompt);
+            const result = session.isGroup
+                ? await generateGroupOfflineChatCompletion(session, history, { signal: offlineRun.controller.signal })
+                : await generateOfflineChatCompletion(session, history, { signal: offlineRun.controller.signal });
+            if (!isCurrentOfflineRun()) return;
+            const continuation = (result.content.trim() || result.rawText.trim()).trim();
+            if (!continuation) throw new Error("AI 没有返回续写内容");
+
+            const updated = updateChatOfflineTurn(session.id, targetTurn.id, {
+                assistantContent: `${writtenSoFar}${continuation}`,
+                summary: result.summary.trim() || targetTurn.summary,
+                summaryTag: result.summaryTag || targetTurn.summaryTag,
+                truncated: undefined,
+            });
+            if (updated) setOfflineTurns(prev => prev.map(item => item.id === updated.id ? updated : item));
+        } catch (error: any) {
+            if (!isCurrentOfflineRun() || isAbortLikeError(error)) return;
+            showChatToast(`继续生成失败: ${error?.message || String(error)}`, 3000);
+        } finally {
+            if (!finishOfflineGenerationRun(session.id, offlineRunId)) return;
+            setIsOfflineGenerating(false);
+            offlineStreamAccumRef.current = "";
+            setOfflineStreamPreview(null);
+        }
+    };
+
     const handleRetry = async (msgId: string) => {
         const msgIndex = messages.findIndex(m => m.id === msgId);
         if (msgIndex === -1 || messages[msgIndex].role !== "assistant") return;
@@ -4862,6 +5070,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     <button onClick={() => void handleOfflineRetryFrom(turn.id)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
                 </div>
                 <div className="flex">
+                    {role === "assistant" && turn.truncated && (
+                        <button onClick={() => void handleOfflineContinueTruncated(turn.id)} className="ctx-menu-btn">继续生成</button>
+                    )}
                     <button onClick={() => handleOfflineDeleteTurn(turn.id)} className="ctx-menu-btn ctx-menu-btn-danger">删除</button>
                     <button onClick={() => handleOfflineDeleteTurnsFrom(turn.id)} className="ctx-menu-btn ctx-menu-btn-danger">删除以下</button>
                 </div>
@@ -4919,6 +5130,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     )}
                 </div>
                 <div className="flex">
+                    {m.role === "assistant" && m.truncated && (
+                        <button onClick={() => void handleContinueTruncated(storedMessageId)} className="ctx-menu-btn">继续生成</button>
+                    )}
                     <button onClick={() => { setQuotingMessage(m); setActiveMessageId(null); }} className="ctx-menu-btn">引用</button>
                     {options?.allowMultiSelect !== false && (
                         <button onClick={() => startMultiSelectFromMessage(m)} className="ctx-menu-btn">多选</button>
